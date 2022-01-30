@@ -14,6 +14,7 @@ from stable_baselines3.common.buffers import DictReplayBuffer, ReplayBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
 from stable_baselines3.common.policies import BasePolicy
+from stable_baselines3.common.recorder import Recorder, Recording, ReplayMode
 from stable_baselines3.common.save_util import load_from_pkl, save_to_pkl
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
@@ -152,6 +153,43 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.policy_kwargs["use_sde"] = self.use_sde
         # For gSDE only
         self.use_sde_at_warmup = use_sde_at_warmup
+
+        self._mode: ReplayMode = ReplayMode.IGNORE
+        self._recorder: Optional[Recorder] = None
+        self._replay: Optional[Recording] = None
+
+    @property
+    def is_active(self) -> bool:
+        return self._mode == ReplayMode.RECORDING
+
+    @property
+    def is_passive(self) -> bool:
+        return self._mode == ReplayMode.REPLAYING
+
+    def _reset(self) -> None:
+        if self._recorder is not None:
+            del self._recorder
+            self._recorder = None
+        if self._replay is not None:
+            del self._replay
+            self._replay = None
+
+    def start_recording(self) -> None:
+        self._reset()
+        self._mode = ReplayMode.RECORDING
+        self._recorder = Recorder()
+
+    @property
+    def recording(self) -> Recording:
+        if not self.is_active:
+            raise RuntimeError("Must be in active/recording mode")
+        assert self._recorder is not None
+        return self._recorder.freeze()
+
+    def load_replay(self, source):
+        self._reset()
+        self._mode = ReplayMode.REPLAYING
+        self._replay = iter(source)
 
     def _convert_train_freq(self) -> None:
         """
@@ -580,11 +618,19 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 # Sample a new noise matrix
                 self.actor.reset_noise(env.num_envs)
 
-            # Select action randomly or according to policy
-            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
+            if self.is_passive:
+                assert self._replay
+                new_obs, rewards, dones, infos, buffer_actions = next(self._replay)
+            else:
+                # Select action randomly or according to policy
+                actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
 
-            # Rescale and perform action
-            new_obs, rewards, dones, infos = env.step(actions)
+                # Rescale and perform action
+                new_obs, rewards, dones, infos = env.step(actions)
+
+                if self.is_active:
+                    assert self._recorder
+                    self._recorder.append(new_obs, rewards, dones, infos, buffer_actions)
 
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
